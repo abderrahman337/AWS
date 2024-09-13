@@ -1,0 +1,61 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Parameters:
+  UserGitURL:
+    Type: String
+Resources:
+  AmplifyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - amplify.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: AmplifyPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "amplify:StartJob"
+                  - "amplify:StopJob"
+                  - "amplify:ListJobs"
+                Resource: "*"
+              - Effect: Allow
+                Action: "codecommit:GitPull"
+                Resource: "arn:aws:codecommit:us-west-2:123456789012:YourRepositoryName"
+
+  DevBranch:
+    Type: AWS::Amplify::Branch
+    Properties:
+      BranchName: master
+      AppId: !GetAtt App.AppId
+      EnableAutoBuild: yes
+      EnvironmentVariables:
+        - Name: USER_BRANCH
+          Value: dev
+
+  App:
+    Type: AWS::Amplify::App
+    Properties:
+      Name: DemoApp
+      Repository: !Ref UserGitURL
+      IAMServiceRole: !GetAtt AmplifyRole.Arn
+      BuildSpec: |
+        version: 1
+        frontend:
+          phases:
+            build:
+              commands: []
+          artifacts:
+            baseDirectory: /
+            files:
+              - '**/*'
+          cache:
+            paths: []

@@ -1,0 +1,743 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Handler: index.handler
+    Timeout: 600
+    MemorySize: 256
+
+Description: >
+  Web based event driven architecture
+
+Parameters:
+  RedshiftClusterEndpoint:
+    Description: Redshift cluster endpoint including port number and database name
+    Type: String
+    Default: redshift-cluster.xxxxxx.region.redshift.amazonaws.com:5439/dev
+  DbUsername:
+    Description: Redshift database user name which has access to run SQL Script.
+    Type: String
+    AllowedPattern: "([a-z])([a-z]|[0-9])*"
+    Default: 'awsuser'
+  DDBTableName:
+    Type: String
+    Default: client_connections
+    Description: The name of the new DynamoDB to store connection identifiers for each connected clients. You may leave it as the default value client_connections
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: ^[A-Za-z_]+$
+    ConstraintDescription: Required. Can be characters and underscore only. No numbers or special characters allowed.
+  WebSocketEndpointSSMParameterName:
+    Type: String
+    Default: REDSHIFT_WSS_ENDPOINT
+    Description: Parameter Name in SSM Parameter Store to store the websocket endpoint uri. You may leave it as the default value REDSHIFT_WSS_ENDPOINT
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: ^[A-Za-z_]+$
+    ConstraintDescription: Required. Can be characters and underscore only. No numbers or special characters allowed.
+
+  RestApiEndpointSSMParameterName:
+    Type: String
+    Default: REDSHIFT_REST_API_ENDPOINT
+    Description: Parameter Name in SSM Parameter Store to store the REST endpoint uri. You may leave it as the default value REDSHIFT_REST_API_ENDPOINT
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: ^[A-Za-z_]+$
+    ConstraintDescription: Required. Can be characters and underscore only. No numbers or special characters allowed.
+
+  UserPoolARN:
+    Description: Cognito Pool ARN.
+    Type: String
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Input Parameters
+        Parameters:
+          - RedshiftClusterEndpoint
+          - DbUsername
+          - DDBTableName
+          - WebSocketEndpointSSMParameterName
+          - RestApiEndpointSSMParameterName
+
+Resources:
+  ApplicationWebSocket:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: ApplicationWebSocket
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: $request.body.action
+
+  ConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId:
+        Ref: ApplicationWebSocket
+      RouteKey: $connect
+      AuthorizationType: NONE
+      OperationName: ConnectRoute
+      Target:
+        Fn::Join:
+        - /
+        - - integrations
+          - Ref: ConnectInteg
+
+  ConnectInteg:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId:
+        Ref: ApplicationWebSocket
+      Description: Connect Integration
+      IntegrationType: AWS_PROXY
+      IntegrationUri:
+        Fn::Sub: arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OnConnectFunction.Arn}/invocations
+
+  DisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId:
+        Ref: ApplicationWebSocket
+      RouteKey: $disconnect
+      AuthorizationType: NONE
+      OperationName: DisconnectRoute
+      Target:
+        Fn::Join:
+        - /
+        - - integrations
+          - Ref: DisconnectInteg
+
+  DisconnectInteg:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId:
+        Ref: ApplicationWebSocket
+      Description: Disconnect Integration
+      IntegrationType: AWS_PROXY
+      IntegrationUri:
+        Fn::Sub: arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OnDisconnectFunction.Arn}/invocations
+
+  SendRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId:
+        Ref: ApplicationWebSocket
+      RouteKey: $default
+      AuthorizationType: NONE
+      OperationName: SendRoute
+      Target:
+        Fn::Join:
+        - /
+        - - integrations
+          - Ref: SendInteg
+
+  SendInteg:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId:
+        Ref: ApplicationWebSocket
+      Description: Send Integration
+      IntegrationType: AWS_PROXY
+      IntegrationUri:
+        Fn::Sub:
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OnConnectFunction.Arn}/invocations
+
+  RedshiftDataApiRestApiEndpoint:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Ref RestApiEndpointSSMParameterName
+      Type: String
+      Value: !Sub "https://${ApplicationRestAPI}.execute-api.${AWS::Region}.amazonaws.com/${ApplicationRestApiStage}"
+
+  Deployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn:
+    - ConnectRoute
+    - DisconnectRoute
+    - SendRoute
+    Properties:
+      ApiId:
+        Ref: ApplicationWebSocket
+
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      StageName: Prod
+      Description: Prod Stage
+      DeploymentId:
+        Ref: Deployment
+      ApiId:
+        Ref: ApplicationWebSocket
+
+  ApplicationRestAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: ApplicationRestApi
+      Description: Rest API for GetResults from Redshift
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  TestAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      IdentitySource: method.request.header.authorization
+      Name: CognitoAuthorizer
+      ProviderARNs:
+        - !Ref UserPoolARN
+      RestApiId: !Ref ApplicationRestAPI
+      Type: COGNITO_USER_POOLS
+
+  ApplicationRestApiGatewayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref TestAuthorizer
+      HttpMethod: GET
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt GetResultsFunction.Arn
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates: {"application/json": "$input.json('$.body')"}
+      ResourceId: !GetAtt ApplicationRestAPI.RootResourceId
+      RestApiId: !Ref ApplicationRestAPI
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels: { "application/json": "Empty" }
+
+  ApplicationRestApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApplicationRestApiGatewayMethod
+    Properties:
+      RestApiId: !Ref ApplicationRestAPI
+
+  ApplicationRestApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId: !Ref ApplicationRestApiGatewayDeployment
+      RestApiId: !Ref ApplicationRestAPI
+      StageName: Prod
+
+  ConnectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+      - AttributeName: connectionId
+        AttributeType: S
+      - AttributeName: statementId
+        AttributeType: S
+      - AttributeName: topicName
+        AttributeType: S
+      KeySchema:
+      - AttributeName: connectionId
+        KeyType: HASH
+      - AttributeName: topicName
+        KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: "GSI"
+          KeySchema:
+            - AttributeName: "statementId"
+              KeyType: "HASH"
+          Projection:
+            ProjectionType: "KEYS_ONLY"
+          ProvisionedThroughput:
+            ReadCapacityUnits: 5
+            WriteCapacityUnits: 5
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      SSESpecification:
+        SSEEnabled: true
+      TableName:
+        Ref: DDBTableName
+
+  LambdaIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: LambdaStartWhatIfIAMRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: QueryScriptS3AccessPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:PutItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                  - dynamodb:UpdateItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:BatchGetItem
+                  - dynamodb:DescribeTable
+                  - dynamodb:ConditionCheckItem
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DDBTableName}"
+                  - !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DDBTableName}/index/*"
+              - Effect: Allow
+                Action:
+                  - execute-api:ManageConnections
+                Resource:
+                  - !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApplicationWebSocket}/*"
+              - Effect: Allow
+                Action:
+                  - redshift-data:ListStatements
+                  - redshift-data:GetStatementResult
+                  - redshift-data:DescribeStatement
+                  - redshift:GetClusterCredentials
+                Resource:
+                  - !Sub
+                    - arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:cluster:${SourceRedshiftClusterIdentifier}
+                    - { SourceRedshiftClusterIdentifier: !Select [ 0, !Split [ ".", !Ref RedshiftClusterEndpoint ] ] }
+                  - !Sub
+                    - "arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:dbname:${SourceRedshiftClusterIdentifier}/${RedshiftDatabaseName}"
+                    - { SourceRedshiftClusterIdentifier: !Select [ 0, !Split [ ".", !Ref RedshiftClusterEndpoint ] ], RedshiftDatabaseName: !Select [ 1, !Split [ "/", !Ref RedshiftClusterEndpoint ] ] }
+                  - !Sub
+                    - "arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:dbuser:${SourceRedshiftClusterIdentifier}/${DbUsername}"
+                    - { SourceRedshiftClusterIdentifier: !Select [ 0, !Split [ ".", !Ref RedshiftClusterEndpoint ] ] }
+  OnConnectFunction:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      Description: OnConnectFunction
+      Role: !GetAtt 'LambdaIAMRole.Arn'
+      Environment:
+        Variables:
+          TABLE_NAME:
+            Ref: DDBTableName
+          REDSHIFT_ENDPOINT:
+            Ref: RedshiftClusterEndpoint
+          REDSHIFT_USER:
+            Ref: DbUsername
+          WS_ENDPOINT_SSM_PARAMETER_NAME:
+            Ref: WebSocketEndpointSSMParameterName
+      InlineCode: |
+        const AWS = require('aws-sdk');
+        exports.handler = async event => {
+          
+          console.log(event);
+          if (event.requestContext.eventType === "MESSAGE"){
+            
+            const redshiftClusterId = process.env.REDSHIFT_ENDPOINT.split('.')[0];
+            const redshiftDatabaseName = process.env.REDSHIFT_ENDPOINT.split('/')[1];
+            const apiGateway = new AWS.ApiGatewayManagementApi({
+              apiVersion: '2018-11-29',
+              wssEndpoint: await getSSMParameter(process.env.WS_ENDPOINT_SSM_PARAMETER_NAME)
+            })
+            const param = JSON.parse(event.body).tripMonth;
+            const topicName = JSON.parse(event.body).topicName;
+            
+            // Replace this with your SQL query
+            const sqlScript = `SELECT * FROM your_table WHERE month = '${param}';`;
+            const statementId = await executeRedshiftSql(sqlScript, redshiftClusterId, redshiftDatabaseName, process.env.REDSHIFT_USER);
+            
+            await putConnectionRecordDdb (process.env.TABLE_NAME, event.requestContext.connectionId, statementId, topicName);
+          }
+
+            const response = {
+                statusCode: 200,
+                body: "Connected"
+            };
+          
+          return response;
+
+        };
+
+        const getSSMParameter = async (param) => new AWS.SSM()
+          .getParameter({ Name: param })
+          .promise()
+          .then(response => {
+            return response.Parameter.Value;
+          })
+          .catch((e) => {
+            console.log('getSSMParameter failed.');
+            console.log(e.stack);
+            throw e;
+          });
+
+        const executeRedshiftSql = async (sqlScript, redshiftClusterId, redshiftDatabaseName, redshiftUser) =>  new AWS.RedshiftData({ region: process.env.AWS_REGION })
+          .executeStatement({
+            ClusterIdentifier: redshiftClusterId,
+            Database: redshiftDatabaseName,
+            DbUser: redshiftUser,
+            Sql: sqlScript,
+            WithEvent: true
+          })
+          .promise()
+          .then(response => response.Id)
+          .catch((e) => {
+            console.log('executeRedshiftSql failed.');
+            console.log(e.stack);
+            throw e;
+          });
+
+        const putConnectionRecordDdb = async (tableName, connectionId, statementId, topicName) => new AWS.DynamoDB.DocumentClient({ apiVersion: '2012-08-10', region: process.env.AWS_REGION })
+          .put({TableName: tableName,
+            Item: {
+              statementId: statementId,
+              connectionId: connectionId,
+              topicName: topicName
+              
+            }
+          })
+          .promise()
+          .catch((e) => {
+            console.log('putConnectionRecordDdb failed.');
+            console.log(e.stack);
+            throw e;
+          });
+
+  SendMessageFunction:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      Description: SendMessageFunction
+      Role: !GetAtt 'LambdaIAMRole.Arn'
+      Environment:
+        Variables:
+          TABLE_NAME:
+            Ref: DDBTableName
+          WS_ENDPOINT_SSM_PARAMETER_NAME:
+            Ref: WebSocketEndpointSSMParameterName
+      InlineCode: |
+        const AWS = require('aws-sdk');
+        exports.handler = async event => {
+          console.log(event);
+          const { TABLE_NAME } = process.env;
+          const wssEndpoint = await getSSMParameter(process.env.WS_ENDPOINT_SSM_PARAMETER_NAME);
+          console.log(wssEndpoint)
+          const statementId = event.data.statementId;
+          const response = await  getConnectionIdTopicName(TABLE_NAME, statementId);
+          const connectionId = response.connectionId;
+          
+          const topicName = response.topicName;
+          if (event.data.state == 'FAILED'){
+            await postMessage(wssEndpoint, connectionId, '{"columns":["Error"],"records":[["SQL Query Failed"]]}');
+          }
+          else{
+          
+            await postMessage(wssEndpoint, connectionId, topicName, statementId);
+          }
+          return { statusCode: 200, body: 'Data sent.' };
+        };
+        const postMessage = async (wssEndpoint, connectionId, topicName, statementId) => new AWS.ApiGatewayManagementApi({apiVersion: '2018-11-29',endpoint: wssEndpoint})
+          .postToConnection({ ConnectionId: connectionId, Data: `${topicName}/${statementId}` })
+          .promise()
+          .catch((e) => {
+            console.log('postMessage failed.');
+            console.log(e.stack);
+            throw e;
+          });
+        const getSSMParameter = async (param) => new AWS.SSM()
+          .getParameter({ Name: param })
+          .promise()
+          .then(response => {
+            return response.Parameter.Value;
+          })
+          .catch((e) => {
+            console.log('getSSMParameter failed.');
+            console.log(e.stack);
+            throw e;
+          });
+        const getConnectionIdTopicName = async (tableName, statementId) => new AWS.DynamoDB.DocumentClient({ apiVersion: '2012-08-10', region: process.env.AWS_REGION })
+          .query({TableName: tableName,
+              IndexName: "GSI",
+              KeyConditionExpression: "statementId = :s",
+              ExpressionAttributeValues: { ":s": statementId }
+              })
+          .promise()
+          .then(response => {
+            console.log(response);
+            
+            return {
+              connectionId: response.Items[0].connectionId,
+              topicName: response.Items[0].topicName
+            }
+          })
+          .catch((e) => {
+            console.log('getConnectionIdTopicName failed.');
+            console.log(e.stack);
+            throw e;
+          });
+
+  GetResultsFunction:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      Description: GetResultsFunctions
+      Role: !GetAtt 'LambdaIAMRole.Arn'
+      InlineCode: |
+        const AWS = require('aws-sdk');
+        exports.handler = async (event) => {
+          
+          console.log(event);
+          const topicName = event.queryStringParameters.topicName;
+          const statementId = event.queryStringParameters.queryId;
+          const results = await getResults(statementId)
+          
+          console.log(results)
+          
+          const response = {
+                statusCode: 200,
+                headers: {
+                    "Access-Control-Allow-Headers" : "Content-Type",
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET,PUT,POST,DELETE"
+                },
+                body: results
+            };
+          
+          return response;
+        };
+
+        const getResults = async (statementId) => new AWS.RedshiftData({ region: process.env.AWS_REGION })
+          .getStatementResult({Id: statementId})
+          .promise()
+          .then(response => {
+
+            let records = [];
+            let output = {};
+            let rowValues = [];
+            output.columns = response.ColumnMetadata.map(metaData => metaData.label);
+            response.Records.forEach( record => {
+              rowValues = record.map(item => Object.values(item));
+              records.push(rowValues.flat());
+            });
+            output.records=records;
+            return JSON.stringify(output);
+          })
+          .catch((e) => {
+            console.log('getResults failed.');
+            console.log(e.stack);
+            throw e;
+          });
+  SetupRedshiftLambdaFunction:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      Description: SetupRedshiftLambdaFunction
+      Handler: index.handler
+      Role: !GetAtt 'SetupLambdaRedshiftDataAPIRole.Arn'
+      Environment:
+        Variables:
+          REDSHIFT_ENDPOINT:
+            Ref: RedshiftClusterEndpoint
+          REDSHIFT_USER:
+            Ref: DbUsername
+      InlineCode: |
+        const AWS = require('aws-sdk');
+        const cfnResponse = require('cfn-response');
+        exports.handler = async (event, context) => {
+          console.log(event);
+          const redshiftClusterId = process.env.REDSHIFT_ENDPOINT.split('.')[0];
+          const redshiftDatabaseName = process.env.REDSHIFT_ENDPOINT.split('/')[1];
+
+          // Script SQL à exécuter
+          const sqlScript = `
+            -- Ajoutez votre script SQL ici
+            CREATE TABLE IF NOT EXISTS my_table (
+                id INT,
+                name VARCHAR(100)
+            );
+          `;
+
+          try {
+            const res = await executeRedshiftSql(redshiftClusterId, redshiftDatabaseName, process.env.REDSHIFT_USER, sqlScript);
+            await sendCfnRes(event, context, cfnResponse.SUCCESS);
+          } catch (error) {
+            console.error(error);
+            await sendCfnRes(event, context, cfnResponse.FAILED);
+          }
+        };
+
+        const sendCfnRes = (event, context, status, data) => {
+          return new Promise(() => cfnResponse.send(event, context, status, {'Data': data}));
+        };
+
+        const executeRedshiftSql = async (redshiftClusterId, redshiftDatabaseName, redshiftUser, script) => {
+          const sqlStatements = script.split(/(?<=\;)/);
+          const redshiftDataClient = new AWS.RedshiftData({region: process.env.AWS_REGION});
+          let res;
+          for (const sql of sqlStatements) {
+            res = await executeSqlDataApi(redshiftDataClient, redshiftClusterId, redshiftDatabaseName, redshiftUser, sql);
+          }
+          return res;
+        };
+
+        const executeSqlDataApi = async (redshiftDataApiClient, redshiftClusterId, redshiftDatabaseName, redshiftUser, query) => {
+          let queryId = '';
+          const executeStatementInput = {
+            ClusterIdentifier: redshiftClusterId,
+            Database: redshiftDatabaseName,
+            DbUser: redshiftUser,
+            Sql: query
+          };
+
+          // Appel de l'API Redshift Data pour exécuter la commande SQL
+          await redshiftDataApiClient.executeStatement(executeStatementInput).promise()
+            .then((response) => {
+              queryId = response.Id;
+            })
+            .catch((error) => {
+              console.log('ExecuteStatement a échoué.');
+              throw new Error(error);
+            });
+
+          // Attendre la fin de l'exécution
+          let { Status: queryStatus } = await getDescribeStatement(redshiftDataApiClient, queryId);
+
+          while (queryStatus !== 'FINISHED' && queryStatus !== 'FAILED') {
+            await new Promise(resolve => setTimeout(resolve, 5000));
+            ({ Status: queryStatus } = await getDescribeStatement(redshiftDataApiClient, queryId));
+          }
+
+          if (queryStatus === 'FAILED') {
+            throw new Error('La requête SQL a échoué.');
+          }
+
+          return queryStatus;
+        };
+
+        const getDescribeStatement = async (redshiftDataApiClient, queryId) => redshiftDataApiClient
+          .describeStatement({ Id: queryId })
+          .promise()
+          .then(response => response)
+          .catch((error) => {
+            console.log('DescribeStatement a échoué.');
+            throw new Error(error);
+          });
+
+  SetupLambdaRedshiftDataAPIRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      Description: IAM Role for Lambda to access Redshift and execute the Data API
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: SetupRedshiftDataApiPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - redshift-data:GetStatementResult
+                  - redshift-data:DescribeStatement
+                  - redshift-data:ExecuteStatement
+                  - redshift:GetClusterCredentials
+                Resource:
+                  - !Sub
+                    - arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:cluster:${SourceRedshiftClusterIdentifier}
+                    - { SourceRedshiftClusterIdentifier: !Select [ 0, !Split [ ".", !Ref RedshiftClusterEndpoint ] ] }
+                  - !Sub
+                    - arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:dbname:${SourceRedshiftClusterIdentifier}/${RedshiftDatabaseName}
+                    - { SourceRedshiftClusterIdentifier: !Select [ 0, !Split [ ".", !Ref RedshiftClusterEndpoint ] ], RedshiftDatabaseName: !Select [ 1, !Split [ "/", !Ref RedshiftClusterEndpoint ] ] }
+                  - !Sub
+                    - arn:aws:redshift:${AWS::Region}:${AWS::AccountId}:dbuser:${SourceRedshiftClusterIdentifier}/${DbUsername}
+                    - { SourceRedshiftClusterIdentifier: !Select [ 0, !Split [ ".", !Ref RedshiftClusterEndpoint ] ] }
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+
+  OnDisconnectFunction:
+    Type: "AWS::Serverless::Function"
+    Properties:
+      Description: OnDisconnectFunction
+      Role: !GetAtt 'LambdaIAMRole.Arn'
+      Environment:
+        Variables:
+          TABLE_NAME:
+            Ref: DDBTableName
+      InlineCode: |
+        const AWS = require('aws-sdk');
+        const ddb = new AWS.DynamoDB.DocumentClient({ apiVersion: '2012-08-10', region: process.env.AWS_REGION });
+        exports.handler = event => {
+          console.log(event.requestContext)
+
+          getRecords(event).then((data) => {
+            data.Items.forEach((item) => {
+              deleteItem(item).then((data) => {});
+            });
+          });
+          return { statusCode: 200, body: 'Disconnected.' };
+        };
+
+        const getRecords = (event) => {
+            const params = {
+            TableName: process.env.TABLE_NAME,
+          }
+          return new Promise((resolve, reject) =>{
+            ddb.scan(params, (err, data) =>{
+              if (err){
+                console.log(err)
+                reject(err);
+              } else {
+                resolve(data);
+              }
+            })
+          });
+        }
+
+        const deleteItem = (item) => {
+          const params = {
+            TableName: process.env.TABLE_NAME,
+            Key: {
+              topicName: item.topicName,
+              connectionId: item.connectionId
+            },
+          };
+
+          return new Promise((resolve, reject) => {
+            ddb.delete(params, (err, data) => {
+              if (err) {
+                console.log(err)
+                reject(err);
+              } else {
+                resolve();
+              }
+            });
+          });
+        }
+
+ 
+
+Outputs:
+  RedshiftDataApiWebSocketEndpoint:
+    Description: The WSS Protocol URI to connect to
+    Value:
+      Fn::Join:
+      - ''
+      - - wss://
+        - Ref: ApplicationWebSocket
+        - .execute-api.
+        - Ref: AWS::Region
+        - .amazonaws.com/
+        - Ref: Stage

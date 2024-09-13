@@ -1,0 +1,57 @@
+{
+    "Stacks": [
+        {
+            "StackId": "arn:aws:cloudformation:us-east-1:872515270223:stack/BackendSetup/458ea210-71cb-11ef-8e4c-0affd00399c1",
+            "StackName": "BackendSetup",
+            "Description": "Web based event driven architecture\n",
+            "Parameters": [
+                {
+                    "ParameterKey": "DDBTableName",
+                    "ParameterValue": "client_connections_a"
+                },
+                {
+                    "ParameterKey": "RestApiEndpointSSMParameterName",
+                    "ParameterValue": "REDSHIFT_REST_API_ENDPOINT_a"
+                },
+                {
+                    "ParameterKey": "WebSocketEndpointSSMParameterName",
+                    "ParameterValue": "REDSHIFT_WSS_ENDPOINT_a"
+                },
+                {
+                    "ParameterKey": "UserPoolARN",
+                    "ParameterValue": "arn:aws:cognito-idp:us-east-1:872515270223:userpool/us-east-1_h6AXBLkDY"
+                },
+                {
+                    "ParameterKey": "DbUsername",
+                    "ParameterValue": "awsuser"
+                },
+                {
+                    "ParameterKey": "RedshiftClusterEndpoint",
+                    "ParameterValue": "redshift-cluster-1.ceoxukbfhxkk.us-east-1.redshift.amazonaws.com:5439/dev"
+                }
+            ],
+            "CreationTime": "2024-09-13T12:25:33.133Z",
+            "RollbackConfiguration": {},
+            "StackStatus": "CREATE_COMPLETE",
+            "DisableRollback": false,
+            "NotificationARNs": [],
+            "Capabilities": [
+                "CAPABILITY_AUTO_EXPAND",
+                "CAPABILITY_NAMED_IAM",
+                "CAPABILITY_IAM"
+            ],
+            "Outputs": [
+                {
+                    "OutputKey": "RedshiftDataApiWebSocketEndpoint",
+                    "OutputValue": "wss://nwizg7m5oj.execute-api.us-east-1.amazonaws.com/Prod",
+                    "Description": "The WSS Protocol URI to connect to"
+                }
+            ],
+            "Tags": [],
+            "EnableTerminationProtection": false,
+            "DriftInformation": {
+                "StackDriftStatus": "NOT_CHECKED"
+            }
+        }
+    ]
+}
